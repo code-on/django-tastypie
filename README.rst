@@ -15,6 +15,7 @@ This is patched version:
 * Validation reworked. Now you can't pass data through validation if field is not validated by form
 * ``FormValidation`` applies validated data to ``bundle.data``, all other data are ignored.
 * Removed PATCH method. PUT method can be used as PATCH - to update few fields.
+* Fixed logging errors to 'django.request' even if DEBUG=True, how it works in Django.
 
 Requirements
 ============
