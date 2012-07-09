@@ -1,6 +1,23 @@
+from copy import copy
 from django.core.exceptions import ImproperlyConfigured
-from django.forms import ModelForm
-from django.forms.models import model_to_dict
+from django.forms import ModelForm, ModelChoiceField, ModelMultipleChoiceField
+from types import StringTypes
+from django.db.models import Model
+from .bundle import Bundle
+
+
+def model_to_dict(bundle, resource):
+    data = {}
+
+    for name, field in resource.fields.items():
+        if field.readonly:
+            continue
+        value = field.dehydrate(bundle)
+        if isinstance(value, Bundle):
+            value = value.data['resource_uri']
+        data[name] = value
+
+    return data
 
 
 class Validation(object):
@@ -10,7 +27,7 @@ class Validation(object):
     def __init__(self, **kwargs):
         pass
 
-    def is_valid(self, bundle, request=None):
+    def is_valid(self, bundle, resource, request=None):
         """
         Performs a check on the data within the bundle (and optionally the
         request) to ensure it is valid.
@@ -42,66 +59,58 @@ class FormValidation(Validation):
         self.form_class = kwargs.pop('form_class')
         super(FormValidation, self).__init__(**kwargs)
 
-    def form_args(self, bundle):
-        data = bundle.data
+    def _prepare_related_value(self, value):
+        if isinstance(value, list):
+            return [self._prepare_related_value(item) for item in value]
+        elif isinstance(value, Model):
+            return value.pk
+        elif isinstance(value, dict) and 'id' in value:
+            return value['id']
+        elif isinstance(value, StringTypes):
+            return value.strip('/').split('/')[-1]
 
-        # Ensure we get a bound Form, regardless of the state of the bundle.
-        if data is None:
-            data = {}
+        return value
 
-        kwargs = {'data': {}}
+    def form_args(self, bundle, resource):
+        bundle_data = bundle.data or {}
+        data = {}
+
+        # use only data that is validated by form
+        for name, field in self.form_class.base_fields.items():
+            if name in bundle_data:
+                data[name] = bundle_data[name]
+
+        kwargs = {}
 
         if hasattr(bundle.obj, 'pk'):
             if issubclass(self.form_class, ModelForm):
                 kwargs['instance'] = bundle.obj
 
-            kwargs['data'] = model_to_dict(bundle.obj)
+            data.update(model_to_dict(bundle, resource))
 
-        kwargs['data'].update(data)
+        # Convert URI to useable id value
+        data = copy(data)
+
+        for name, field in self.form_class.base_fields.items():
+            if isinstance(field, (ModelChoiceField, ModelMultipleChoiceField)) and name in data:
+                data[name] = self._prepare_related_value(data[name])
+
+        kwargs['data'] = data
         return kwargs
 
-    def is_valid(self, bundle, request=None):
+    def is_valid(self, bundle, resource, request=None):
         """
         Performs a check on ``bundle.data``to ensure it is valid.
 
         If the form is valid, an empty list (all valid) will be returned. If
         not, a list of errors will be returned.
         """
-
-        form = self.form_class(**self.form_args(bundle))
-
-        if form.is_valid():
-            return {}
-
-        # The data is invalid. Let's collect all the error messages & return
-        # them.
-        return form.errors
-
-
-class CleanedDataFormValidation(FormValidation):
-    """
-    A validation class that uses a Django ``Form`` to validate the data.
-
-    This class **ALTERS** data sent by the user!!!
-
-    This class requires a ``form_class`` argument, which should be a Django
-    ``Form`` (or ``ModelForm``, though ``save`` will never be called) class.
-    This form will be used to validate the data in ``bundle.data``.
-    """
-    def is_valid(self, bundle, request=None):
-        """
-        Checks ``bundle.data``to ensure it is valid & replaces it with the
-        cleaned results.
-
-        If the form is valid, an empty list (all valid) will be returned. If
-        not, a list of errors will be returned.
-        """
-        form = self.form_class(**self.form_args(bundle))
+        form = self.form_class(**self.form_args(bundle, resource))
 
         if form.is_valid():
-            # We're different here & relying on having a reference to the same
-            # bundle the rest of the process is using.
-            bundle.data = form.cleaned_data
+            model_data = model_to_dict(bundle, resource)
+            model_data.update(form.cleaned_data)
+            bundle.data = model_data
             return {}
 
         # The data is invalid. Let's collect all the error messages & return

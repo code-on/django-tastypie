@@ -61,7 +61,7 @@ class ResourceOptions(object):
     throttle = BaseThrottle()
     validation = Validation()
     paginator_class = Paginator
-    allowed_methods = ['get', 'post', 'put', 'delete', 'patch']
+    allowed_methods = ['get', 'post', 'put', 'delete']
     list_allowed_methods = None
     detail_allowed_methods = None
     limit = getattr(settings, 'API_LIMIT_PER_PAGE', 20)
@@ -92,7 +92,7 @@ class ResourceOptions(object):
                 if not override_name.startswith('_'):
                     overrides[override_name] = getattr(meta, override_name)
 
-        allowed_methods = overrides.get('allowed_methods', ['get', 'post', 'put', 'delete', 'patch'])
+        allowed_methods = overrides.get('allowed_methods', ['get', 'post', 'put', 'delete'])
 
         if overrides.get('list_allowed_methods', None) is None:
             overrides['list_allowed_methods'] = allowed_methods
@@ -239,6 +239,10 @@ class Resource(object):
         if isinstance(exception, NOT_FOUND_EXCEPTIONS):
             response_class = HttpResponseNotFound
 
+        if not isinstance(exception, (NotFound, ObjectDoesNotExist)):
+            log = logging.getLogger('django.request.tastypie')
+            log.error('Internal Server Error: %s' % request.path, exc_info=sys.exc_info(), extra={'status_code': 500, 'request': request})
+
         if settings.DEBUG:
             data = {
                 "error_message": unicode(exception),
@@ -251,9 +255,6 @@ class Resource(object):
         # When DEBUG is False, send an error message to the admins (unless it's
         # a 404, in which case we check the setting).
         if not isinstance(exception, NOT_FOUND_EXCEPTIONS):
-            log = logging.getLogger('django.request.tastypie')
-            log.error('Internal Server Error: %s' % request.path, exc_info=sys.exc_info(), extra={'status_code': 500, 'request':request})
-
             if django.VERSION < (1, 3, 0) and getattr(settings, 'SEND_BROKEN_LINK_EMAILS', False):
                 from django.core.mail import mail_admins
                 subject = 'Error (%s IP): %s' % ((request.META.get('REMOTE_ADDR') in settings.INTERNAL_IPS and 'internal' or 'EXTERNAL'), request.path)
@@ -603,6 +604,15 @@ class Resource(object):
         ``Models``.
         """
         return obj_list
+
+    def get_bundle_detail_data(self, bundle):
+        """
+        Convenience method to return the ``detail_uri_name`` attribute off
+        ``bundle.obj``.
+
+        Usually just accesses ``bundle.obj.pk`` by default.
+        """
+        return getattr(bundle.obj, self._meta.detail_uri_name)
 
     # URL-related methods.
 
@@ -1053,7 +1063,7 @@ class Resource(object):
         If validation fails, an error is raised with the error messages
         serialized inside it.
         """
-        errors = self._meta.validation.is_valid(bundle, request)
+        errors = self._meta.validation.is_valid(bundle, self, request)
 
         if errors:
             bundle.errors[self._meta.resource_name] = errors
@@ -1265,152 +1275,6 @@ class Resource(object):
         except NotFound:
             return http.HttpNotFound()
 
-    def patch_list(self, request, **kwargs):
-        """
-        Updates a collection in-place.
-
-        The exact behavior of ``PATCH`` to a list resource is still the matter of
-        some debate in REST circles, and the ``PATCH`` RFC isn't standard. So the
-        behavior this method implements (described below) is something of a
-        stab in the dark. It's mostly cribbed from GData, with a smattering
-        of ActiveResource-isms and maybe even an original idea or two.
-
-        The ``PATCH`` format is one that's similar to the response returned from
-        a ``GET`` on a list resource::
-
-            {
-              "objects": [{object}, {object}, ...],
-              "deleted_objects": ["URI", "URI", "URI", ...],
-            }
-
-        For each object in ``objects``:
-
-            * If the dict does not have a ``resource_uri`` key then the item is
-              considered "new" and is handled like a ``POST`` to the resource list.
-
-            * If the dict has a ``resource_uri`` key and the ``resource_uri`` refers
-              to an existing resource then the item is a update; it's treated
-              like a ``PATCH`` to the corresponding resource detail.
-
-            * If the dict has a ``resource_uri`` but the resource *doesn't* exist,
-              then this is considered to be a create-via-``PUT``.
-
-        Each entry in ``deleted_objects`` referes to a resource URI of an existing
-        resource to be deleted; each is handled like a ``DELETE`` to the relevent
-        resource.
-
-        In any case:
-
-            * If there's a resource URI it *must* refer to a resource of this
-              type. It's an error to include a URI of a different resource.
-
-            * ``PATCH`` is all or nothing. If a single sub-operation fails, the
-              entire request will fail and all resources will be rolled back.
-
-          * For ``PATCH`` to work, you **must** have ``put`` in your
-            :ref:`detail-allowed-methods` setting.
-
-          * To delete objects via ``deleted_objects`` in a ``PATCH`` request you
-            **must** have ``delete`` in your :ref:`detail-allowed-methods`
-            setting.
-
-        """
-        request = convert_post_to_patch(request)
-        deserialized = self.deserialize(request, request.raw_post_data, format=request.META.get('CONTENT_TYPE', 'application/json'))
-
-        if "objects" not in deserialized:
-            raise BadRequest("Invalid data sent.")
-
-        if len(deserialized["objects"]) and 'put' not in self._meta.detail_allowed_methods:
-            raise ImmediateHttpResponse(response=http.HttpMethodNotAllowed())
-
-        for data in deserialized["objects"]:
-            # If there's a resource_uri then this is either an
-            # update-in-place or a create-via-PUT.
-            if "resource_uri" in data:
-                uri = data.pop('resource_uri')
-
-                try:
-                    obj = self.get_via_uri(uri, request=request)
-
-                    # The object does exist, so this is an update-in-place.
-                    bundle = self.build_bundle(obj=obj, request=request)
-                    bundle = self.full_dehydrate(bundle)
-                    bundle = self.alter_detail_data_to_serialize(request, bundle)
-                    self.update_in_place(request, bundle, data)
-                except (ObjectDoesNotExist, MultipleObjectsReturned):
-                    # The object referenced by resource_uri doesn't exist,
-                    # so this is a create-by-PUT equivalent.
-                    data = self.alter_deserialized_detail_data(request, data)
-                    bundle = self.build_bundle(data=dict_strip_unicode_keys(data), request=request)
-                    self.obj_create(bundle, request=request)
-            else:
-                # There's no resource URI, so this is a create call just
-                # like a POST to the list resource.
-                data = self.alter_deserialized_detail_data(request, data)
-                bundle = self.build_bundle(data=dict_strip_unicode_keys(data), request=request)
-                self.obj_create(bundle, request=request)
-
-        if len(deserialized.get('deleted_objects', [])) and 'delete' not in self._meta.detail_allowed_methods:
-            raise ImmediateHttpResponse(response=http.HttpMethodNotAllowed())
-
-        for uri in deserialized.get('deleted_objects', []):
-            obj = self.get_via_uri(uri, request=request)
-            self.obj_delete(request=request, _obj=obj)
-
-        return http.HttpAccepted()
-
-    def patch_detail(self, request, **kwargs):
-        """
-        Updates a resource in-place.
-
-        Calls ``obj_update``.
-
-        If the resource is updated, return ``HttpAccepted`` (202 Accepted).
-        If the resource did not exist, return ``HttpNotFound`` (404 Not Found).
-        """
-        request = convert_post_to_patch(request)
-
-        # We want to be able to validate the update, but we can't just pass
-        # the partial data into the validator since all data needs to be
-        # present. Instead, we basically simulate a PUT by pulling out the
-        # original data and updating it in-place.
-        # So first pull out the original object. This is essentially
-        # ``get_detail``.
-        try:
-            obj = self.cached_obj_get(request=request, **self.remove_api_resource_names(kwargs))
-        except ObjectDoesNotExist:
-            return http.HttpNotFound()
-        except MultipleObjectsReturned:
-            return http.HttpMultipleChoices("More than one resource is found at this URI.")
-
-        bundle = self.build_bundle(obj=obj, request=request)
-        bundle = self.full_dehydrate(bundle)
-        bundle = self.alter_detail_data_to_serialize(request, bundle)
-
-        # Now update the bundle in-place.
-        deserialized = self.deserialize(request, request.raw_post_data, format=request.META.get('CONTENT_TYPE', 'application/json'))
-        self.update_in_place(request, bundle, deserialized)
-
-        if not self._meta.always_return_data:
-            return http.HttpAccepted()
-        else:
-            bundle = self.full_dehydrate(bundle)
-            bundle = self.alter_detail_data_to_serialize(request, bundle)
-            return self.create_response(request, bundle, response_class=http.HttpAccepted)
-
-    def update_in_place(self, request, original_bundle, new_data):
-        """
-        Update the object in original_bundle in-place using new_data.
-        """
-        original_bundle.data.update(**dict_strip_unicode_keys(new_data))
-
-        # Now we've got a bundle with the new data sitting in it and we're
-        # we're basically in the same spot as a PUT request. SO the rest of this
-        # function is cribbed from put_detail.
-        self.alter_deserialized_detail_data(request, original_bundle.data)
-        return self.obj_update(original_bundle, request=request, pk=original_bundle.obj.pk)
-
     def get_schema(self, request, **kwargs):
         """
         Returns a serialized form of the schema of the resource.
@@ -1613,6 +1477,9 @@ class ModelResource(Resource):
 
             if getattr(f, 'auto_now_add', False):
                 kwargs['default'] = f.auto_now_add
+
+            if not f.editable or f.primary_key:
+                kwargs['readonly'] = True
 
             final_fields[f.name] = api_field_class(**kwargs)
             final_fields[f.name].instance_name = f.name
@@ -1865,7 +1732,7 @@ class ModelResource(Resource):
         for key, value in kwargs.items():
             setattr(bundle.obj, key, value)
         bundle = self.full_hydrate(bundle)
-        self.is_valid(bundle,request)
+        self.is_valid(bundle, request)
 
         if bundle.errors:
             self.error_response(bundle.errors, request)
@@ -1885,7 +1752,7 @@ class ModelResource(Resource):
         """
         A ORM-specific implementation of ``obj_update``.
         """
-        if not bundle.obj or not bundle.obj.pk:
+        if not bundle.obj or not self.get_bundle_detail_data(bundle):
             # Attempt to hydrate data from kwargs before doing a lookup for the object.
             # This step is needed so certain values (like datetime) will pass model validation.
             try:
@@ -1895,7 +1762,7 @@ class ModelResource(Resource):
                 lookup_kwargs = kwargs.copy()
 
                 for key in kwargs.keys():
-                    if key == 'pk':
+                    if key == self._meta.detail_uri_name:
                         continue
                     elif getattr(bundle.obj, key, NOT_AVAILABLE) is not NOT_AVAILABLE:
                         lookup_kwargs[key] = getattr(bundle.obj, key)
@@ -1913,7 +1780,7 @@ class ModelResource(Resource):
                 raise NotFound("A model instance matching the provided arguments could not be found.")
 
         bundle = self.full_hydrate(bundle)
-        self.is_valid(bundle,request)
+        self.is_valid(bundle, request)
 
         if bundle.errors and not skip_errors:
             self.error_response(bundle.errors, request)
@@ -1962,16 +1829,6 @@ class ModelResource(Resource):
 
         obj.delete()
 
-    def patch_list(self, request, **kwargs):
-        """
-        An ORM-specific implementation of ``patch_list``.
-
-        Necessary because PATCH should be atomic (all-success or all-fail)
-        and the only way to do this neatly is at the database level.
-        """
-        with transaction.commit_on_success():
-            return super(ModelResource, self).patch_list(request, **kwargs)
-
     def rollback(self, bundles):
         """
         A ORM-specific implementation of ``rollback``.
@@ -1980,7 +1837,7 @@ class ModelResource(Resource):
         bundles.
         """
         for bundle in bundles:
-            if bundle.obj and getattr(bundle.obj, 'pk', None):
+            if bundle.obj and self.get_bundle_detail_data(bundle):
                 bundle.obj.delete()
 
     def save_related(self, bundle):
@@ -2017,10 +1874,10 @@ class ModelResource(Resource):
             # Because sometimes it's ``None`` & that's OK.
             if related_obj:
                 if field_object.related_name:
-                    if not bundle.obj.pk:
+                    if not self.get_bundle_detail_data(bundle):
                         bundle.obj.save()
-                    setattr(related_obj, field_object.related_name, bundle.obj)
 
+                    setattr(related_obj, field_object.related_name, bundle.obj)
                 related_obj.save()
                 setattr(bundle.obj, field_object.attribute, related_obj)
 

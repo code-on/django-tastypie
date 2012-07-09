@@ -7,6 +7,14 @@ Creating delicious APIs for Django apps since 2010.
 Currently in beta (v0.9.11) but being used actively in production on several
 sites.
 
+Patch note
+==========
+
+This is patched version:
+
+* Validation reworked. Now you can't pass data through validation if field is not validated by form
+* ``FormValidation`` applies validated data to ``bundle.data``, all other data are ignored.
+* Removed PATCH method. PUT method can be used as PATCH - to update few fields.
 
 Requirements
 ============
