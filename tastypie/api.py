@@ -75,13 +75,6 @@ class Api(object):
             return getattr(self, view)(request, *args, **kwargs)
         return wrapper
 
-    def override_urls(self):
-        """
-        Deprecated. Will be removed by v1.0.0. Please use ``prepend_urls`` instead.
-        """
-        warnings.warn("'override_urls' is a deprecated method & will be removed by v1.0.0. Please use ``prepend_urls`` instead.")
-        return self.prepend_urls()
-
     def prepend_urls(self):
         """
         A hook for adding your own URLs or matching before the default URLs.
@@ -103,10 +96,6 @@ class Api(object):
             pattern_list.append((r"^(?P<api_name>%s)/" % self.api_name, include(self._registry[name].urls)))
 
         urlpatterns = self.prepend_urls()
-
-        if self.override_urls():
-            warnings.warn("'override_urls' is a deprecated method & will be removed by v1.0.0. Please rename your method to ``prepend_urls``.")
-            urlpatterns += self.override_urls()
 
         urlpatterns += patterns('',
             *pattern_list
